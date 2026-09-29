@@ -1,5 +1,9 @@
 use crate::follow::Follow;
-use crate::{ForwardsUOffset, SOffsetT, SkipSizePrefix, UOffsetT, VOffsetT, Vector, SIZE_UOFFSET};
+use crate::table::Table;
+use crate::{
+    ForwardsUOffset, SOffsetT, SkipSizePrefix, UOffsetT, VOffsetT, Vector, SIZE_UOFFSET,
+    SIZE_VOFFSET,
+};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -374,6 +378,19 @@ impl<'opts, 'buf> Verifier<'opts, 'buf> {
     ) -> Result<TableVerifier<'ver, 'opts, 'buf>> {
         let vtable_pos = self.deref_soffset(table_pos)?;
         let vtable_len = self.get_u16(vtable_pos)? as usize;
+        // A vtable always contains the two header VOffsetTs (`num_bytes` and
+        // `object_inline_num_bytes`). Anything shorter than that cannot be read
+        // through the safe VTable API, so reject it up front. Without this
+        // check `range_in_buffer(vtable_pos, vtable_len)` below trivially
+        // succeeds for `vtable_len == 0` and the safe read
+        // `VTable::object_inline_num_bytes()` (and `VTable::num_fields`, which
+        // would underflow) escapes the buffer.
+        if vtable_len < 2 * SIZE_VOFFSET {
+            return InvalidFlatbuffer::new_range_oob(
+                vtable_pos,
+                vtable_pos.saturating_add(vtable_len),
+            );
+        }
         self.is_aligned::<VOffsetT>(vtable_pos.saturating_add(vtable_len))?; // i.e. vtable_len is even.
         self.range_in_buffer(vtable_pos, vtable_len)?;
         // Check bounds.
@@ -518,6 +535,23 @@ impl<T: Verifiable> Verifiable for ForwardsUOffset<T> {
         let offset = v.get_uoffset(pos)? as usize;
         let next_pos = offset.saturating_add(pos);
         T::run_verifier(v, next_pos)
+    }
+}
+
+/// Verifies that `pos` holds a valid table, without knowing the schema of that
+/// table: it checks the `soffset` at `pos` dereferences in-bounds and that the
+/// vtable it points to lies completely inside the buffer.
+///
+/// This is the fallback used for union values whose discriminant is not one the
+/// reader knows about: the concrete variant cannot be recovered, but a Rust
+/// reader always interprets a union value as `ForwardsUOffset<Table>`
+/// (see the generated `_as_*`/`union` accessors), so the verifier must at least
+/// guarantee that this is a traversable table.
+impl<'a> Verifiable for Table<'a> {
+    #[inline]
+    fn run_verifier(v: &mut Verifier, pos: usize) -> Result<()> {
+        v.visit_table(pos)?.finish();
+        Ok(())
     }
 }
 
